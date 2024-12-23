@@ -3,16 +3,16 @@
 #![no_std]
 
 use bitflags::bitflags;
-use embedded_hal::blocking::delay::DelayMs;
-use embedded_hal::blocking::i2c::{Read, Write, WriteRead};
+use embedded_hal::delay::DelayNs;
+use embedded_hal::i2c::I2c;
 
 // 2.2 Timing Specification for the Sensor System
 // Table 4
 // TODO: Support longer times needed with lower voltage (Table 5).
-const SOFT_RESET_TIME_MS: u8 = 1;
+const SOFT_RESET_TIME_MS: u32 = 1;
 
 // 4: Operation and Communication
-const COMMAND_WAIT_TIME_MS: u8 = 1;
+const COMMAND_WAIT_TIME_MS: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Sht3x<I2C> {
@@ -22,7 +22,7 @@ pub struct Sht3x<I2C> {
 
 impl<I2C, E> Sht3x<I2C>
 where
-    I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
+    I2C: I2c<Error = E>,
 {
     /// Creates a new driver.
     pub const fn new(i2c: I2C, address: Address) -> Self {
@@ -30,7 +30,12 @@ where
     }
 
     /// Send an I2C command.
-    fn command<D: DelayMs<u8>>(&mut self, command: Command, delay: &mut D, wait_time: Option<u8>) -> Result<(), Error<E>> {
+    fn command<D: DelayNs>(
+        &mut self,
+        command: Command,
+        delay: &mut D,
+        wait_time: Option<u32>,
+    ) -> Result<(), Error<E>> {
         let cmd_bytes = command.value().to_be_bytes();
         self.i2c
             .write(self.address as u8, &cmd_bytes)
@@ -42,27 +47,38 @@ where
     }
 
     /// Take a temperature and humidity measurement.
-    pub fn measure<D: DelayMs<u8>>(&mut self, cs: ClockStretch, rpt: Repeatability, delay: &mut D) -> Result<Measurement, Error<E>> {
-        self.command(Command::SingleShot(cs, rpt), delay, Some(rpt.max_duration()))?;
+    pub fn measure<D: DelayNs>(
+        &mut self,
+        cs: ClockStretch,
+        rpt: Repeatability,
+        delay: &mut D,
+    ) -> Result<Measurement, Error<E>> {
+        self.command(
+            Command::SingleShot(cs, rpt),
+            delay,
+            Some(rpt.max_duration()),
+        )?;
         let mut buf = [0; 6];
-        self.i2c.read(self.address as u8, &mut buf)
-                .map_err(Error::I2c)?;
+        self.i2c
+            .read(self.address as u8, &mut buf)
+            .map_err(Error::I2c)?;
 
-        let temperature = check_crc([buf[0], buf[1]], buf[2])
-            .map(convert_temperature)?;
-        let humidity = check_crc([buf[3], buf[4]], buf[5])
-            .map(convert_humidity)?;
+        let temperature = check_crc([buf[0], buf[1]], buf[2]).map(convert_temperature)?;
+        let humidity = check_crc([buf[3], buf[4]], buf[5]).map(convert_humidity)?;
 
-        Ok(Measurement{ temperature, humidity })
+        Ok(Measurement {
+            temperature,
+            humidity,
+        })
     }
 
     /// Soft reset the sensor.
-    pub fn reset<D: DelayMs<u8>>(&mut self, delay: &mut D) -> Result<(), Error<E>> {
+    pub fn reset<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), Error<E>> {
         self.command(Command::SoftReset, delay, Some(SOFT_RESET_TIME_MS))
     }
 
     /// Read the status register.
-    pub fn status<D: DelayMs<u8>>(&mut self, delay: &mut D) -> Result<Status, Error<E>> {
+    pub fn status<D: DelayNs>(&mut self, delay: &mut D) -> Result<Status, Error<E>> {
         self.command(Command::Status, delay, None)?;
         let mut buf = [0; 3];
         self.i2c
@@ -74,7 +90,7 @@ where
     }
 
     /// Clear the status register.
-    pub fn clear_status<D: DelayMs<u8>>(&mut self, delay: &mut D) -> Result<(), Error<E>> {
+    pub fn clear_status<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), Error<E>> {
         self.command(Command::ClearStatus, delay, None)
     }
 }
@@ -165,13 +181,14 @@ pub enum Repeatability {
 }
 
 impl Repeatability {
-    /// Maximum measurement duration in milliseconds
-    const fn max_duration(&self) -> u8 {
-        match *self {
+    /// Maximum measurement duration in nanoseconds
+    const fn max_duration(&self) -> u32 {
+        let milliseconds = match *self {
             Repeatability::Low => 4,
             Repeatability::Medium => 6,
             Repeatability::High => 15,
-        }
+        };
+        milliseconds * 1000000
     }
 }
 
@@ -191,37 +208,37 @@ enum Command {
 
 impl Command {
     const fn value(&self) -> u16 {
-        use ClockStretch::Enabled as CSEnabled;
         use ClockStretch::Disabled as CSDisabled;
+        use ClockStretch::Enabled as CSEnabled;
         use Rate::*;
         use Repeatability::*;
         match *self {
             // 4.3 Measurement Commands for Single Shot Data Acquisition Mode
             // Table 8
-            Command::SingleShot(CSEnabled,  High)   => 0x2C06,
-            Command::SingleShot(CSEnabled,  Medium) => 0x2C0D,
-            Command::SingleShot(CSEnabled,  Low)    => 0x2C10,
-            Command::SingleShot(CSDisabled, High)   => 0x2400,
+            Command::SingleShot(CSEnabled, High) => 0x2C06,
+            Command::SingleShot(CSEnabled, Medium) => 0x2C0D,
+            Command::SingleShot(CSEnabled, Low) => 0x2C10,
+            Command::SingleShot(CSDisabled, High) => 0x2400,
             Command::SingleShot(CSDisabled, Medium) => 0x240B,
-            Command::SingleShot(CSDisabled, Low)    => 0x2416,
+            Command::SingleShot(CSDisabled, Low) => 0x2416,
 
             // 4.5 Measurement Commands for Periodic Data Acquisition Mode
             // Table 9
-            Command::Periodic(R0_5, High)   => 0x2032,
+            Command::Periodic(R0_5, High) => 0x2032,
             Command::Periodic(R0_5, Medium) => 0x2024,
-            Command::Periodic(R0_5, Low)    => 0x202F,
-            Command::Periodic(R1,   High)   => 0x2130,
-            Command::Periodic(R1,   Medium) => 0x2126,
-            Command::Periodic(R1,   Low)    => 0x212D,
-            Command::Periodic(R2,   High)   => 0x2236,
-            Command::Periodic(R2,   Medium) => 0x2220,
-            Command::Periodic(R2,   Low)    => 0x222B,
-            Command::Periodic(R4,   High)   => 0x2334,
-            Command::Periodic(R4,   Medium) => 0x2322,
-            Command::Periodic(R4,   Low)    => 0x2329,
-            Command::Periodic(R10,  High)   => 0x2737,
-            Command::Periodic(R10,  Medium) => 0x2721,
-            Command::Periodic(R10,  Low)    => 0x272A,
+            Command::Periodic(R0_5, Low) => 0x202F,
+            Command::Periodic(R1, High) => 0x2130,
+            Command::Periodic(R1, Medium) => 0x2126,
+            Command::Periodic(R1, Low) => 0x212D,
+            Command::Periodic(R2, High) => 0x2236,
+            Command::Periodic(R2, Medium) => 0x2220,
+            Command::Periodic(R2, Low) => 0x222B,
+            Command::Periodic(R4, High) => 0x2334,
+            Command::Periodic(R4, Medium) => 0x2322,
+            Command::Periodic(R4, Low) => 0x2329,
+            Command::Periodic(R10, High) => 0x2737,
+            Command::Periodic(R10, Medium) => 0x2721,
+            Command::Periodic(R10, Low) => 0x272A,
 
             // 4.6 Readout of Measurement Results for Periodic Mode
             // Table 10
@@ -241,7 +258,7 @@ impl Command {
 
             // 4.10 Heater
             // Table 15
-            Command::HeaterEnable  => 0x306D,
+            Command::HeaterEnable => 0x306D,
             Command::HeaterDisable => 0x3066,
 
             // 4.11 Status register
